@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Iterable, Mapping, Sequence
 
 import xlsxwriter
+from xlsxwriter.utility import xl_col_to_name
 
 
 COLUMNS = [
@@ -94,6 +95,7 @@ def rows_to_xlsx(
             "in_memory": True,
         },
     )
+    workbook.set_calc_mode("auto")
 
     worksheet = workbook.add_worksheet(
         "REKAP FAKTUR"
@@ -214,6 +216,24 @@ def rows_to_xlsx(
         3.43,
     )
 
+    # Pemetaan posisi kolom Excel secara dinamis
+    column_positions = {
+        column_name: START_COL + index
+        for index, column_name in enumerate(columns)
+    }
+
+    # Hilangkan warning "number stored as text" jika kolom NO. FAKTUR PAJAK dipilih
+    if "NO. FAKTUR PAJAK" in column_positions:
+        no_faktur_col = column_positions["NO. FAKTUR PAJAK"]
+        worksheet.ignore_errors(
+            {
+                "number_stored_as_text": (
+                    f"{xl_col_to_name(no_faktur_col)}2:"
+                    f"{xl_col_to_name(no_faktur_col)}{max(2, len(rows) + 1)}"
+                )
+            }
+        )
+
     # Tulis header mulai dari B1.
     for index, column in enumerate(columns):
         excel_column = START_COL + index
@@ -245,6 +265,11 @@ def rows_to_xlsx(
         "JUMLAH",
     }
 
+    # Pelacakan batas baris item untuk setiap faktur.
+    item_start_excel_row: int | None = None
+    item_end_excel_row: int | None = None
+    current_invoice_key: tuple[object, object, object] | None = None
+
     for excel_row, row in enumerate(
         rows,
         start=1,
@@ -264,8 +289,30 @@ def rows_to_xlsx(
                     None,
                     blank_format,
                 )
-
+            item_start_excel_row = None
+            item_end_excel_row = None
+            current_invoice_key = None
             continue
+
+        excel_row_number = excel_row + 1
+
+        if row_type == "item":
+            invoice_key = (
+                row.get("NO. FAKTUR PAJAK"),
+                row.get("TGL"),
+                row.get("NAMA CUSTOMER"),
+            )
+
+            # Faktur baru harus memulai range subtotal baru,
+            # meskipun tidak ada baris separator.
+            if invoice_key != current_invoice_key:
+                current_invoice_key = invoice_key
+                item_start_excel_row = excel_row_number
+                item_end_excel_row = excel_row_number
+            else:
+                if item_start_excel_row is None:
+                    item_start_excel_row = excel_row_number
+                item_end_excel_row = excel_row_number
 
         for index, column in enumerate(columns):
             excel_column = START_COL + index
@@ -309,6 +356,7 @@ def rows_to_xlsx(
             else:
                 cell_format = text_format
 
+            # Penanganan penulisan sel dengan Formula atau Nilai Biasa
             if value is None:
                 worksheet.write_blank(
                     excel_row,
@@ -347,18 +395,111 @@ def rows_to_xlsx(
                 )
 
             elif column in numeric_columns:
-                numeric_value = (
+                cached_value = (
                     float(value)
                     if isinstance(value, Decimal)
                     else value
                 )
 
-                worksheet.write_number(
-                    excel_row,
-                    excel_column,
-                    numeric_value,
-                    cell_format,
-                )
+                formula_written = False
+
+                # 1. Formula JUMLAH untuk Faktur Satu Item
+                if (
+                    row_type == "item"
+                    and column == "JUMLAH"
+                    and "DPP" in column_positions
+                    and "PPN" in column_positions
+                ):
+                    dpp_col_name = xl_col_to_name(column_positions["DPP"])
+                    ppn_col_name = xl_col_to_name(column_positions["PPN"])
+
+                    dpp_val = row.get("DPP")
+                    ppn_val = row.get("PPN")
+
+                    dpp_num = float(dpp_val) if isinstance(dpp_val, Decimal) else (dpp_val or 0.0)
+                    ppn_num = float(ppn_val) if isinstance(ppn_val, Decimal) else (ppn_val or 0.0)
+
+                    ppnbm_comp = cached_value - dpp_num - ppn_num
+
+                    if abs(ppnbm_comp) < 1e-6:
+                        formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}"
+                    else:
+                        ppnbm_str = f"{ppnbm_comp:+.2f}".rstrip("0").rstrip(".")
+                        formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}{ppnbm_str}"
+
+                    worksheet.write_formula(
+                        excel_row,
+                        excel_column,
+                        formula_str,
+                        cell_format,
+                        cached_value,
+                    )
+                    formula_written = True
+
+                # 2. Formula Subtotal (DPP, PPN, JUMLAH) untuk Faktur Multi-Item
+                elif row_type == "subtotal":
+                    if column == "DPP" and item_start_excel_row is not None and item_end_excel_row is not None:
+                        dpp_col_name = xl_col_to_name(column_positions["DPP"])
+                        formula_str = f"=SUM({dpp_col_name}{item_start_excel_row}:{dpp_col_name}{item_end_excel_row})"
+                        worksheet.write_formula(
+                            excel_row,
+                            excel_column,
+                            formula_str,
+                            cell_format,
+                            cached_value,
+                        )
+                        formula_written = True
+
+                    elif column == "PPN" and item_start_excel_row is not None and item_end_excel_row is not None:
+                        ppn_col_name = xl_col_to_name(column_positions["PPN"])
+                        formula_str = f"=SUM({ppn_col_name}{item_start_excel_row}:{ppn_col_name}{item_end_excel_row})"
+                        worksheet.write_formula(
+                            excel_row,
+                            excel_column,
+                            formula_str,
+                            cell_format,
+                            cached_value,
+                        )
+                        formula_written = True
+
+                    elif (
+                        column == "JUMLAH"
+                        and "DPP" in column_positions
+                        and "PPN" in column_positions
+                    ):
+                        dpp_col_name = xl_col_to_name(column_positions["DPP"])
+                        ppn_col_name = xl_col_to_name(column_positions["PPN"])
+
+                        sub_dpp_val = row.get("DPP")
+                        sub_ppn_val = row.get("PPN")
+
+                        sub_dpp_num = float(sub_dpp_val) if isinstance(sub_dpp_val, Decimal) else (sub_dpp_val or 0.0)
+                        sub_ppn_num = float(sub_ppn_val) if isinstance(sub_ppn_val, Decimal) else (sub_ppn_val or 0.0)
+
+                        ppnbm_comp = cached_value - sub_dpp_num - sub_ppn_num
+
+                        if abs(ppnbm_comp) < 1e-6:
+                            formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}"
+                        else:
+                            ppnbm_str = f"{ppnbm_comp:+.2f}".rstrip("0").rstrip(".")
+                            formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}{ppnbm_str}"
+
+                        worksheet.write_formula(
+                            excel_row,
+                            excel_column,
+                            formula_str,
+                            cell_format,
+                            cached_value,
+                        )
+                        formula_written = True
+
+                if not formula_written:
+                    worksheet.write_number(
+                        excel_row,
+                        excel_column,
+                        cached_value,
+                        cell_format,
+                    )
 
             else:
                 worksheet.write_string(
@@ -367,6 +508,11 @@ def rows_to_xlsx(
                     str(value),
                     cell_format,
                 )
+
+        if row_type == "subtotal":
+            item_start_excel_row = None
+            item_end_excel_row = None
+            current_invoice_key = None
 
     # Filter mencakup header dan seluruh data.
     worksheet.autofilter(
