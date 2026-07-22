@@ -9,6 +9,7 @@ from parser import invoices_to_rows, parse_batch
 
 st.set_page_config(
     page_title="Ekstraktor Faktur Pajak ke Excel",
+    page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded",
 )
