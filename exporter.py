@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import io
-import math
 from datetime import datetime
 from decimal import Decimal
 from typing import Iterable, Mapping, Sequence
@@ -24,22 +23,27 @@ COLUMNS = [
 ]
 
 
+# Lebar kolom mengikuti kurang lebih format
+# Rekapan Faktur Pajak yang digunakan sebagai referensi.
 WIDTHS = {
-    "TGL": 12,
-    "NO. FAKTUR PAJAK": 26,
-    "NAMA CUSTOMER": 28,
-    "JENIS BARANG": 82,
-    "QTY": 14,
-    "SATUAN": 10,
-    "@ RP": 16,
-    "DPP": 19,
-    "PPN": 19,
-    "JUMLAH": 20,
+    "TGL": 11,
+    "NO. FAKTUR PAJAK": 30,
+    "NAMA CUSTOMER": 23.5,
+    "JENIS BARANG": 31,
+    "QTY": 13,
+    "SATUAN": 7,
+    "@ RP": 15,
+    "DPP": 22,
+    "PPN": 21,
+    "JUMLAH": 22,
 }
 
 
-# Index kolom dimulai dari 0.
-# 0 = A, 1 = B.
+# Index kolom dimulai dari 0:
+# 0 = A
+# 1 = B
+#
+# Hasil dimulai dari B1.
 START_COL = 1
 
 
@@ -72,33 +76,6 @@ def selected_columns(
         )
 
     return result
-
-
-def row_height(
-    description: object,
-) -> float:
-    """
-    Menghitung tinggi baris berdasarkan panjang
-    deskripsi jenis barang.
-    """
-    character_count = len(
-        str(description or "")
-    )
-
-    estimated_lines = max(
-        1,
-        math.ceil(
-            character_count / 105
-        ),
-    )
-
-    return min(
-        120,
-        max(
-            30,
-            estimated_lines * 15 + 6,
-        ),
-    )
 
 
 def rows_to_xlsx(
@@ -135,14 +112,16 @@ def rows_to_xlsx(
             "bold": True,
             "align": "center",
             "bg_color": "#D9D9D9",
-            "text_wrap": True,
         }
     )
 
+    # Tidak memakai text_wrap.
+    # Deskripsi panjang tetap satu baris dan akan
+    # terpotong secara visual di sisi kanan.
     text_format = workbook.add_format(
         {
             **base_format,
-            "text_wrap": True,
+            "align": "left",
         }
     )
 
@@ -161,15 +140,13 @@ def rows_to_xlsx(
         }
     )
 
-    # Semua nilai numerik ditampilkan dengan dua angka desimal.
+    # Nilai disimpan sebagai angka asli.
     #
-    # Excel English:
+    # Excel regional English:
     # 1,020.00
     #
-    # Excel Indonesia:
+    # Excel regional Indonesia:
     # 1.020,00
-    #
-    # Nilai tetap disimpan sebagai angka, bukan teks.
     number_code = (
         "#,##0.00;"
         "[Red]-#,##0.00;"
@@ -184,6 +161,17 @@ def rows_to_xlsx(
         }
     )
 
+    # JUMLAH untuk faktur yang hanya memiliki satu item.
+    total_number_format = workbook.add_format(
+        {
+            **base_format,
+            "bold": True,
+            "num_format": number_code,
+            "align": "right",
+        }
+    )
+
+    # DPP, PPN, dan JUMLAH pada subtotal faktur multi-item.
     subtotal_number_format = workbook.add_format(
         {
             **base_format,
@@ -193,31 +181,40 @@ def rows_to_xlsx(
         }
     )
 
+    # Baris kosong tetap memiliki border penuh.
     blank_format = workbook.add_format(
-        base_format
+        {
+            **base_format,
+        }
     )
 
+    # Hilangkan gridline bawaan karena tabel sudah
+    # menggunakan border sendiri.
     worksheet.hide_gridlines(2)
 
-    # Membekukan header baris pertama.
+    # Tinggi default seluruh baris, termasuk baris kosong.
+    worksheet.set_default_row(15)
+
+    # Header sedikit lebih tinggi.
+    worksheet.set_row(
+        0,
+        28,
+    )
+
+    # Freeze hanya baris header.
     worksheet.freeze_panes(
         1,
         0,
     )
 
-    # Kolom A sengaja kosong.
+    # Kolom A sengaja dikosongkan.
     worksheet.set_column(
         0,
         0,
         3.43,
     )
 
-    worksheet.set_row(
-        0,
-        28,
-    )
-
-    # Header dimulai dari B1.
+    # Tulis header mulai dari B1.
     for index, column in enumerate(columns):
         excel_column = START_COL + index
 
@@ -240,13 +237,6 @@ def rows_to_xlsx(
         - 1
     )
 
-    worksheet.autofilter(
-        0,
-        START_COL,
-        0,
-        last_column,
-    )
-
     numeric_columns = {
         "QTY",
         "@ RP",
@@ -264,15 +254,10 @@ def rows_to_xlsx(
             "item",
         )
 
+        # Baris separator tetap menggunakan tinggi default
+        # dan tetap memiliki border penuh.
         if row_type == "separator":
-            worksheet.set_row(
-                excel_row,
-                8,
-            )
-
-            for index in range(
-                len(columns)
-            ):
+            for index in range(len(columns)):
                 worksheet.write_blank(
                     excel_row,
                     START_COL + index,
@@ -281,19 +266,6 @@ def rows_to_xlsx(
                 )
 
             continue
-
-        if row_type == "subtotal":
-            worksheet.set_row(
-                excel_row,
-                22,
-            )
-        else:
-            worksheet.set_row(
-                excel_row,
-                row_height(
-                    row.get("JENIS BARANG")
-                ),
-            )
 
         for index, column in enumerate(columns):
             excel_column = START_COL + index
@@ -309,6 +281,8 @@ def rows_to_xlsx(
                 cell_format = center_format
 
             elif column in numeric_columns:
+                # Subtotal faktur multi-item:
+                # DPP, PPN, dan JUMLAH dibuat bold.
                 if (
                     row_type == "subtotal"
                     and column in {
@@ -317,9 +291,18 @@ def rows_to_xlsx(
                         "JUMLAH",
                     }
                 ):
-                    cell_format = (
-                        subtotal_number_format
-                    )
+                    cell_format = subtotal_number_format
+
+                # Faktur satu item:
+                # JUMLAH langsung berada di baris item
+                # dan dibuat bold.
+                elif (
+                    row_type == "item"
+                    and column == "JUMLAH"
+                    and value is not None
+                ):
+                    cell_format = total_number_format
+
                 else:
                     cell_format = number_format
 
@@ -354,8 +337,8 @@ def rows_to_xlsx(
                 )
 
             elif column == "NO. FAKTUR PAJAK":
-                # Nomor faktur wajib disimpan sebagai teks
-                # agar angka 0 di depan tidak hilang.
+                # Disimpan sebagai teks agar angka nol
+                # di depan tidak hilang.
                 worksheet.write_string(
                     excel_row,
                     excel_column,
@@ -366,10 +349,7 @@ def rows_to_xlsx(
             elif column in numeric_columns:
                 numeric_value = (
                     float(value)
-                    if isinstance(
-                        value,
-                        Decimal,
-                    )
+                    if isinstance(value, Decimal)
                     else value
                 )
 
@@ -381,12 +361,20 @@ def rows_to_xlsx(
                 )
 
             else:
-                worksheet.write(
+                worksheet.write_string(
                     excel_row,
                     excel_column,
-                    value,
+                    str(value),
                     cell_format,
                 )
+
+    # Filter mencakup header dan seluruh data.
+    worksheet.autofilter(
+        0,
+        START_COL,
+        len(rows),
+        last_column,
+    )
 
     worksheet.set_landscape()
 
@@ -446,7 +434,6 @@ def rows_to_csv(
                     for column in columns
                 }
             )
-
             continue
 
         clean = {
