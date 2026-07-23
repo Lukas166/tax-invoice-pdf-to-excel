@@ -74,8 +74,10 @@ UNIT_ALIASES = {
     "roll": "ROLL",
     "rol": "ROLL",
 
-    "lembar": "LEMBAR",
-    "sheet": "LEMBAR",
+    "lembar": "LBR",
+    "lbr": "LBR",
+    "sheet": "LBR",
+    "sheets": "LBR",
 
     "batang": "BATANG",
 
