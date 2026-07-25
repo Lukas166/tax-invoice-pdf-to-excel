@@ -216,6 +216,7 @@ def preview_rows(
     numeric_columns = {
         "QTY",
         "@ RP",
+        "HARGA JUAL",
         "DPP",
         "PPN",
         "JUMLAH",

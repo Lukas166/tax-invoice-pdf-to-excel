@@ -799,22 +799,37 @@ def parse_invoice_pdf(
     else:
         ppn_output = ppn_pdf
 
+    # Alokasi HARGA JUAL
+    hj_delta = gross_total - sum((item.line_amount for item in items), Decimal("0"))
+    if items and hj_delta != 0:
+        items[0].line_amount += hj_delta
+
     item_weights = [
         item.weight
         for item in items
     ]
 
-    dpp_parts = allocate(
-        dpp_total,
-        item_weights,
-    )
+    # Alokasi DPP
+    dpp_parts = [
+        round_rupiah(item.line_amount * Decimal("11") / Decimal("12"))
+        for item in items
+    ]
+    dpp_delta = dpp_total - sum(dpp_parts, Decimal("0"))
+    if dpp_parts and dpp_delta != 0:
+        dpp_parts[0] += dpp_delta
 
-    # PPN dibagi berdasarkan DPP item,
-    # bukan langsung dari harga jual.
-    ppn_parts = allocate(
-        ppn_output,
-        dpp_parts,
-    )
+    # Alokasi PPN
+    ppn_parts = []
+    for item in items:
+        if not_collected and zero_ppn_when_not_collected:
+            ppn_parts.append(Decimal("0"))
+        else:
+            ppn_parts.append(round_rupiah(item.line_amount * Decimal("0.11")))
+            
+    if not (not_collected and zero_ppn_when_not_collected):
+        ppn_delta = ppn_output - sum(ppn_parts, Decimal("0"))
+        if ppn_parts and ppn_delta != 0:
+            ppn_parts[0] += ppn_delta
 
     item_ppnbm_values = [
         round_rupiah(
@@ -1067,7 +1082,7 @@ def invoices_to_rows(
 
         for item in current_invoice.items:
             item_total = (
-                item.dpp
+                item.line_amount
                 + item.ppn
             )
 
@@ -1077,6 +1092,7 @@ def invoices_to_rows(
             rows.append(
                 {
                     "_ROW_TYPE": "item",
+                    "_PPN_ZEROED": (current_invoice.not_collected and current_invoice.ppn_output == Decimal("0")),
 
                     "TGL": current_invoice.invoice_date,
 
@@ -1098,6 +1114,10 @@ def invoices_to_rows(
 
                     "@ RP": excel_number(
                         item.unit_price
+                    ),
+
+                    "HARGA JUAL": excel_number(
+                        item.line_amount
                     ),
 
                     "DPP": excel_number(
@@ -1125,9 +1145,19 @@ def invoices_to_rows(
             has_multiple_items
             and include_subtotal
         ):
+            harga_jual_subtotal = sum(
+                (item.line_amount for item in current_invoice.items),
+                Decimal("0")
+            )
+
+            jumlah_subtotal = harga_jual_subtotal + current_invoice.ppn_output
+            if include_ppnbm:
+                jumlah_subtotal += current_invoice.ppnbm_total
+
             rows.append(
                 {
                     "_ROW_TYPE": "subtotal",
+                    "_PPN_ZEROED": (current_invoice.not_collected and current_invoice.ppn_output == Decimal("0")),
 
                     "TGL": current_invoice.invoice_date,
 
@@ -1144,6 +1174,10 @@ def invoices_to_rows(
                     "SATUAN": None,
                     "@ RP": None,
 
+                    "HARGA JUAL": excel_number(
+                        harga_jual_subtotal
+                    ),
+
                     "DPP": excel_number(
                         current_invoice.dpp_total
                     ),
@@ -1153,9 +1187,7 @@ def invoices_to_rows(
                     ),
 
                     "JUMLAH": excel_number(
-                        current_invoice.total(
-                            include_ppnbm
-                        )
+                        jumlah_subtotal
                     ),
                 }
             )
@@ -1172,6 +1204,7 @@ def invoices_to_rows(
             rows.append(
                 {
                     "_ROW_TYPE": "separator",
+                    "_PPN_ZEROED": False,
                     "TGL": None,
                     "NO. FAKTUR PAJAK": None,
                     "NAMA CUSTOMER": None,
@@ -1179,6 +1212,7 @@ def invoices_to_rows(
                     "QTY": None,
                     "SATUAN": None,
                     "@ RP": None,
+                    "HARGA JUAL": None,
                     "DPP": None,
                     "PPN": None,
                     "JUMLAH": None,

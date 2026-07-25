@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Mapping, Sequence
 
 import xlsxwriter
@@ -18,6 +18,7 @@ COLUMNS = [
     "QTY",
     "SATUAN",
     "@ RP",
+    "HARGA JUAL",
     "DPP",
     "PPN",
     "JUMLAH",
@@ -34,6 +35,7 @@ WIDTHS = {
     "QTY": 13,
     "SATUAN": 7,
     "@ RP": 15,
+    "HARGA JUAL": 17.5,
     "DPP": 22,
     "PPN": 21,
     "JUMLAH": 22,
@@ -114,6 +116,7 @@ def rows_to_xlsx(
             "bold": True,
             "align": "center",
             "bg_color": "#D9D9D9",
+            "text_wrap": True,
         }
     )
 
@@ -237,11 +240,13 @@ def rows_to_xlsx(
     # Tulis header mulai dari B1.
     for index, column in enumerate(columns):
         excel_column = START_COL + index
+        
+        header_text = "HARGA\nJUAL" if column == "HARGA JUAL" else column
 
         worksheet.write(
             0,
             excel_column,
-            column,
+            header_text,
             header_format,
         )
 
@@ -260,6 +265,7 @@ def rows_to_xlsx(
     numeric_columns = {
         "QTY",
         "@ RP",
+        "HARGA JUAL",
         "DPP",
         "PPN",
         "JUMLAH",
@@ -270,6 +276,77 @@ def rows_to_xlsx(
     item_end_excel_row: int | None = None
     current_invoice_key: tuple[object, object, object] | None = None
 
+    # Pre-pass: Hitung murni formula Excel secara berurutan dan cari selisihnya
+    invoice_data = {}
+
+    for idx, row in enumerate(rows):
+        if row.get("_ROW_TYPE", "item") == "item":
+            key = (row.get("NO. FAKTUR PAJAK"), row.get("TGL"), row.get("NAMA CUSTOMER"))
+            if key not in invoice_data:
+                invoice_data[key] = {
+                    "first_idx": idx,
+                    "items": [],
+                    "pdf_hj": Decimal("0"),
+                    "pdf_dpp": Decimal("0"),
+                    "pdf_ppn": Decimal("0"),
+                }
+            
+            qty = Decimal(str(row.get("QTY", 0) or 0))
+            rp = Decimal(str(row.get("@ RP", 0) or 0))
+            is_zero_ppn = row.get("_PPN_ZEROED", False)
+            
+            invoice_data[key]["items"].append({
+                "idx": idx,
+                "qty": qty,
+                "rp": rp,
+                "is_zero_ppn": is_zero_ppn
+            })
+            
+            invoice_data[key]["pdf_hj"] += Decimal(str(row.get("HARGA JUAL", 0) or 0))
+            invoice_data[key]["pdf_dpp"] += Decimal(str(row.get("DPP", 0) or 0))
+            invoice_data[key]["pdf_ppn"] += Decimal(str(row.get("PPN", 0) or 0))
+
+    invoice_deltas = {}
+    invoice_first_row_idx = {}
+    
+    for key, data in invoice_data.items():
+        invoice_first_row_idx[key] = data["first_idx"]
+        
+        # 1. HARGA JUAL
+        pure_hj_list = [(item["qty"] * item["rp"]).quantize(Decimal("1"), rounding=ROUND_HALF_UP) for item in data["items"]]
+        sum_pure_hj = sum(pure_hj_list)
+        hj_delta = (data["pdf_hj"] - sum_pure_hj).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        
+        final_hj_list = list(pure_hj_list)
+        if final_hj_list:
+            final_hj_list[0] += hj_delta
+            
+        # 2. DPP (Berdasarkan QTY * RP, tidak terpengaruh koreksi Harga Jual)
+        pure_dpp_list = [(hj * Decimal("11") / Decimal("12")).quantize(Decimal("1"), rounding=ROUND_HALF_UP) for hj in pure_hj_list]
+        sum_pure_dpp = sum(pure_dpp_list)
+        dpp_delta = (data["pdf_dpp"] - sum_pure_dpp).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        
+        final_dpp_list = list(pure_dpp_list)
+        if final_dpp_list:
+            final_dpp_list[0] += dpp_delta
+            
+        # 3. PPN (Berdasarkan HARGA JUAL yang sudah dikoreksi)
+        pure_ppn_list = []
+        for i, item in enumerate(data["items"]):
+            if item["is_zero_ppn"]:
+                pure_ppn_list.append(Decimal("0"))
+            else:
+                pure_ppn_list.append((final_hj_list[i] * Decimal("0.11")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        
+        sum_pure_ppn = sum(pure_ppn_list)
+        ppn_delta = (data["pdf_ppn"] - sum_pure_ppn).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        
+        invoice_deltas[key] = {
+            "HARGA JUAL": hj_delta,
+            "DPP": dpp_delta,
+            "PPN": ppn_delta,
+        }
+
     for excel_row, row in enumerate(
         rows,
         start=1,
@@ -278,6 +355,8 @@ def rows_to_xlsx(
             "_ROW_TYPE",
             "item",
         )
+        # We need row index for delta checking
+        row_idx = excel_row - 1
 
         # Baris separator tetap menggunakan tinggi default
         # dan tetap memiliki border penuh.
@@ -333,6 +412,7 @@ def rows_to_xlsx(
                 if (
                     row_type == "subtotal"
                     and column in {
+                        "HARGA JUAL",
                         "DPP",
                         "PPN",
                         "JUMLAH",
@@ -341,12 +421,12 @@ def rows_to_xlsx(
                     cell_format = subtotal_number_format
 
                 # Faktur satu item:
-                # JUMLAH langsung berada di baris item
-                # dan dibuat bold.
+                # JUMLAH (dan kolom terkait) langsung berada di baris item
+                # dan dibuat bold sesuai dengan subtotal.
                 elif (
                     row_type == "item"
-                    and column == "JUMLAH"
-                    and value is not None
+                    and column in {"HARGA JUAL", "DPP", "PPN", "JUMLAH"}
+                    and row.get("JUMLAH") is not None
                 ):
                     cell_format = total_number_format
 
@@ -403,94 +483,112 @@ def rows_to_xlsx(
 
                 formula_written = False
 
-                # 1. Formula JUMLAH untuk Faktur Satu Item
-                if (
-                    row_type == "item"
-                    and column == "JUMLAH"
-                    and "DPP" in column_positions
-                    and "PPN" in column_positions
-                ):
-                    dpp_col_name = xl_col_to_name(column_positions["DPP"])
-                    ppn_col_name = xl_col_to_name(column_positions["PPN"])
+                if row_type == "item":
+                    if column == "HARGA JUAL" and "QTY" in column_positions and "@ RP" in column_positions:
+                        qty_col_name = xl_col_to_name(column_positions["QTY"])
+                        rp_col_name = xl_col_to_name(column_positions["@ RP"])
+                        
+                        qty_val = Decimal(str(row.get("QTY", 0) or 0))
+                        rp_val = Decimal(str(row.get("@ RP", 0) or 0))
+                        
+                        delta = Decimal("0")
+                        if row_idx == invoice_first_row_idx.get(invoice_key, -1):
+                            delta = invoice_deltas.get(invoice_key, {}).get("HARGA JUAL", Decimal("0"))
+                        
+                        delta_str = f"{delta:+.0f}" if delta != 0 else ""
 
-                    dpp_val = row.get("DPP")
-                    ppn_val = row.get("PPN")
-
-                    dpp_num = float(dpp_val) if isinstance(dpp_val, Decimal) else (dpp_val or 0.0)
-                    ppn_num = float(ppn_val) if isinstance(ppn_val, Decimal) else (ppn_val or 0.0)
-
-                    ppnbm_comp = cached_value - dpp_num - ppn_num
-
-                    if abs(ppnbm_comp) < 1e-6:
-                        formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}"
-                    else:
-                        ppnbm_str = f"{ppnbm_comp:+.2f}".rstrip("0").rstrip(".")
-                        formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}{ppnbm_str}"
-
-                    worksheet.write_formula(
-                        excel_row,
-                        excel_column,
-                        formula_str,
-                        cell_format,
-                        cached_value,
-                    )
-                    formula_written = True
-
-                # 2. Formula Subtotal (DPP, PPN, JUMLAH) untuk Faktur Multi-Item
-                elif row_type == "subtotal":
-                    if column == "DPP" and item_start_excel_row is not None and item_end_excel_row is not None:
-                        dpp_col_name = xl_col_to_name(column_positions["DPP"])
-                        formula_str = f"=SUM({dpp_col_name}{item_start_excel_row}:{dpp_col_name}{item_end_excel_row})"
-                        worksheet.write_formula(
-                            excel_row,
-                            excel_column,
-                            formula_str,
-                            cell_format,
-                            cached_value,
-                        )
+                        formula_str = f"=ROUND({qty_col_name}{excel_row_number}*{rp_col_name}{excel_row_number},0){delta_str}"
+                        worksheet.write_formula(excel_row, excel_column, formula_str, cell_format, cached_value)
                         formula_written = True
 
-                    elif column == "PPN" and item_start_excel_row is not None and item_end_excel_row is not None:
+                    elif column == "DPP":
+                        if "QTY" in column_positions and "@ RP" in column_positions:
+                            qty_col_name = xl_col_to_name(column_positions["QTY"])
+                            rp_col_name = xl_col_to_name(column_positions["@ RP"])
+                            
+                            delta = Decimal("0")
+                            if row_idx == invoice_first_row_idx.get(invoice_key, -1):
+                                delta = invoice_deltas.get(invoice_key, {}).get("DPP", Decimal("0"))
+
+                            delta_str = f"{delta:+.0f}" if delta != 0 else ""
+
+                            formula_str = f"=ROUND({qty_col_name}{excel_row_number}*{rp_col_name}{excel_row_number}*11/12,0){delta_str}"
+                            worksheet.write_formula(excel_row, excel_column, formula_str, cell_format, cached_value)
+                            formula_written = True
+
+                    elif column == "PPN":
+                        if row.get("_PPN_ZEROED"):
+                            worksheet.write_formula(excel_row, excel_column, "=0", cell_format, cached_value)
+                            formula_written = True
+                        elif "HARGA JUAL" in column_positions:
+                            hj_col_name = xl_col_to_name(column_positions["HARGA JUAL"])
+                            
+                            delta = Decimal("0")
+                            if row_idx == invoice_first_row_idx.get(invoice_key, -1):
+                                delta = invoice_deltas.get(invoice_key, {}).get("PPN", Decimal("0"))
+
+                            delta_str = f"{delta:+.0f}" if delta != 0 else ""
+
+                            formula_str = f"=ROUND({hj_col_name}{excel_row_number}*11%,0){delta_str}"
+                            worksheet.write_formula(excel_row, excel_column, formula_str, cell_format, cached_value)
+                            formula_written = True
+                        elif "QTY" in column_positions and "@ RP" in column_positions:
+                            qty_col_name = xl_col_to_name(column_positions["QTY"])
+                            rp_col_name = xl_col_to_name(column_positions["@ RP"])
+                            
+                            delta = Decimal("0")
+                            if row_idx == invoice_first_row_idx.get(invoice_key, -1):
+                                delta = invoice_deltas.get(invoice_key, {}).get("PPN", Decimal("0"))
+
+                            delta_str = f"{delta:+.0f}" if delta != 0 else ""
+
+                            formula_str = f"=ROUND(ROUND({qty_col_name}{excel_row_number}*{rp_col_name}{excel_row_number},0)*11%,0){delta_str}"
+                            worksheet.write_formula(excel_row, excel_column, formula_str, cell_format, cached_value)
+                            formula_written = True
+
+                    elif column == "JUMLAH" and value is not None and "HARGA JUAL" in column_positions and "PPN" in column_positions:
+                        hj_col_name = xl_col_to_name(column_positions["HARGA JUAL"])
                         ppn_col_name = xl_col_to_name(column_positions["PPN"])
-                        formula_str = f"=SUM({ppn_col_name}{item_start_excel_row}:{ppn_col_name}{item_end_excel_row})"
-                        worksheet.write_formula(
-                            excel_row,
-                            excel_column,
-                            formula_str,
-                            cell_format,
-                            cached_value,
-                        )
-                        formula_written = True
 
-                    elif (
-                        column == "JUMLAH"
-                        and "DPP" in column_positions
-                        and "PPN" in column_positions
-                    ):
-                        dpp_col_name = xl_col_to_name(column_positions["DPP"])
-                        ppn_col_name = xl_col_to_name(column_positions["PPN"])
+                        hj_val = Decimal(str(row.get("HARGA JUAL", 0) or 0))
+                        ppn_val = Decimal(str(row.get("PPN", 0) or 0))
+                        jumlah_val = Decimal(str(value))
 
-                        sub_dpp_val = row.get("DPP")
-                        sub_ppn_val = row.get("PPN")
+                        ppnbm_comp = jumlah_val - hj_val - ppn_val
 
-                        sub_dpp_num = float(sub_dpp_val) if isinstance(sub_dpp_val, Decimal) else (sub_dpp_val or 0.0)
-                        sub_ppn_num = float(sub_ppn_val) if isinstance(sub_ppn_val, Decimal) else (sub_ppn_val or 0.0)
-
-                        ppnbm_comp = cached_value - sub_dpp_num - sub_ppn_num
-
-                        if abs(ppnbm_comp) < 1e-6:
-                            formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}"
+                        if abs(ppnbm_comp) < Decimal("0.01"):
+                            formula_str = f"={hj_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}"
                         else:
-                            ppnbm_str = f"{ppnbm_comp:+.2f}".rstrip("0").rstrip(".")
-                            formula_str = f"={dpp_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}{ppnbm_str}"
+                            ppnbm_str = f"{float(ppnbm_comp):+.2f}".rstrip("0").rstrip(".")
+                            formula_str = f"={hj_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}{ppnbm_str}"
 
-                        worksheet.write_formula(
-                            excel_row,
-                            excel_column,
-                            formula_str,
-                            cell_format,
-                            cached_value,
-                        )
+                        worksheet.write_formula(excel_row, excel_column, formula_str, cell_format, cached_value)
+                        formula_written = True
+
+                elif row_type == "subtotal":
+                    if column in {"HARGA JUAL", "DPP", "PPN"} and item_start_excel_row is not None and item_end_excel_row is not None:
+                        col_name = xl_col_to_name(column_positions[column])
+                        formula_str = f"=SUM({col_name}{item_start_excel_row}:{col_name}{item_end_excel_row})"
+                        worksheet.write_formula(excel_row, excel_column, formula_str, cell_format, cached_value)
+                        formula_written = True
+
+                    elif column == "JUMLAH" and value is not None and "HARGA JUAL" in column_positions and "PPN" in column_positions:
+                        hj_col_name = xl_col_to_name(column_positions["HARGA JUAL"])
+                        ppn_col_name = xl_col_to_name(column_positions["PPN"])
+
+                        hj_val = Decimal(str(row.get("HARGA JUAL", 0) or 0))
+                        ppn_val = Decimal(str(row.get("PPN", 0) or 0))
+                        jumlah_val = Decimal(str(value))
+
+                        ppnbm_comp = jumlah_val - hj_val - ppn_val
+
+                        if abs(ppnbm_comp) < Decimal("0.01"):
+                            formula_str = f"={hj_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}"
+                        else:
+                            ppnbm_str = f"{float(ppnbm_comp):+.2f}".rstrip("0").rstrip(".")
+                            formula_str = f"={hj_col_name}{excel_row_number}+{ppn_col_name}{excel_row_number}{ppnbm_str}"
+
+                        worksheet.write_formula(excel_row, excel_column, formula_str, cell_format, cached_value)
                         formula_written = True
 
                 if not formula_written:
@@ -567,6 +665,7 @@ def rows_to_csv(
     numeric_columns = {
         "QTY",
         "@ RP",
+        "HARGA JUAL",
         "DPP",
         "PPN",
         "JUMLAH",
